@@ -12,6 +12,7 @@ import monotonic_align
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
 from commons import init_weights, get_padding
+from Speaker_Encoder.speaker_encoder import Convolution_LSTM_cos
 
 
 class StochasticDurationPredictor(nn.Module):
@@ -412,6 +413,13 @@ class SynthesizerTrn(nn.Module):
     n_speakers=0,
     gin_channels=0,
     use_sdp=True,
+    slice_length=430,
+    hidden_dim1=512,
+    hidden_dim2=256,
+    hidden_dim3=32,
+    l_hidden=756,
+    num_layers=3,
+    n_mel_channels=80,
     **kwargs):
 
     super().__init__()
@@ -452,9 +460,20 @@ class SynthesizerTrn(nn.Module):
       self.dp = StochasticDurationPredictor(hidden_channels, 192, 3, 0.5, 4, gin_channels=gin_channels)
     else:
       self.dp = DurationPredictor(hidden_channels, 256, 3, 0.5, gin_channels=gin_channels)
-
+    """
     if n_speakers > 1:
       self.emb_g = nn.Embedding(n_speakers, gin_channels)
+    """
+    if n_speakers > 1:
+      self.emb_g = Convolution_LSTM_cos(encoder_dim=slice_length,
+    hidden_dim1=hidden_dim1,
+    hidden_dim2=hidden_dim2,
+    hiddem_dim3=hidden_dim3,
+    l_hidden = l_hidden,
+    num_layers = num_layers,
+    input_size = n_mel_channels,
+    embedding_size = gin_channels,
+    kernel=5)
 
   def forward(self, x, x_lengths, y, y_lengths, sid=None):
 

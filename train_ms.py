@@ -16,14 +16,17 @@ from torch.cuda.amp import autocast, GradScaler
 import commons
 import utils
 from data_utils import (
-  TextAudioSpeakerLoader,
-  TextAudioSpeakerCollate,
+  Zero_TextAudioSpeakerLoader,
+  Zero_TextAudioSpeakerCollate,
   DistributedBucketSampler
 )
 from models import (
   SynthesizerTrn,
   MultiPeriodDiscriminator,
 )
+
+from Speaker_Encoder.speaker_encoder import Convolution_LSTM_cos
+
 from losses import (
   generator_loss,
   discriminator_loss,
@@ -32,7 +35,6 @@ from losses import (
 )
 from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from text.symbols import symbols
-
 
 torch.backends.cudnn.benchmark = True
 global_step = 0
@@ -44,7 +46,7 @@ def main():
 
   n_gpus = torch.cuda.device_count()
   os.environ['MASTER_ADDR'] = 'localhost'
-  os.environ['MASTER_PORT'] = '80000'
+  os.environ['MASTER_PORT'] = '65535'
 
   hps = utils.get_hparams()
   mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
@@ -63,7 +65,7 @@ def run(rank, n_gpus, hps):
   torch.manual_seed(hps.train.seed)
   torch.cuda.set_device(rank)
 
-  train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps.data)
+  train_dataset = Zero_TextAudioSpeakerLoader(hps.data.training_files, hps.data)
   train_sampler = DistributedBucketSampler(
       train_dataset,
       hps.train.batch_size,
@@ -71,20 +73,27 @@ def run(rank, n_gpus, hps):
       num_replicas=n_gpus,
       rank=rank,
       shuffle=True)
-  collate_fn = TextAudioSpeakerCollate()
-  train_loader = DataLoader(train_dataset, num_workers=8, shuffle=False, pin_memory=True,
-      collate_fn=collate_fn, batch_sampler=train_sampler)
+  collate_fn = Zero_TextAudioSpeakerCollate(slice_length=hps.data.slice_length)
+  train_loader = DataLoader(train_dataset, num_workers=4, shuffle=False, pin_memory=True,
+      collate_fn=collate_fn, batch_sampler = train_sampler)
   if rank == 0:
-    eval_dataset = TextAudioSpeakerLoader(hps.data.validation_files, hps.data)
-    eval_loader = DataLoader(eval_dataset, num_workers=8, shuffle=False,
+    eval_dataset = Zero_TextAudioSpeakerLoader(hps.data.validation_files, hps.data)
+    eval_loader = DataLoader(eval_dataset, num_workers=4, shuffle=False,
         batch_size=hps.train.batch_size, pin_memory=True,
-        drop_last=False, collate_fn=collate_fn)
+        drop_last=True, collate_fn=collate_fn)
 
   net_g = SynthesizerTrn(
       len(symbols),
       hps.data.filter_length // 2 + 1,
       hps.train.segment_size // hps.data.hop_length,
       n_speakers=hps.data.n_speakers,
+      slice_length=hps.data.slice_length,
+      hidden_dim1=hps.LSTM.hidden_dim1,
+      hidden_dim2=hps.LSTM.hidden_dim2,
+      hiddem_dim3=hps.LSTM.hidden_dim3,
+      l_hidden = hps.LSTM.l_hidden,
+      num_layers = hps.LSTM.num_layers,
+      n_mel_channels = hps.data.n_mel_channels,
       **hps.model).cuda(rank)
   net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
   optim_g = torch.optim.AdamW(
@@ -97,8 +106,28 @@ def run(rank, n_gpus, hps):
       hps.train.learning_rate, 
       betas=hps.train.betas, 
       eps=hps.train.eps)
-  net_g = DDP(net_g, device_ids=[rank])
-  net_d = DDP(net_d, device_ids=[rank])
+
+  #Speaker Encoder Load
+  t_model = Convolution_LSTM_cos( encoder_dim=hps.data.slice_length,
+    hidden_dim1=hps.LSTM.hidden_dim1,
+    hidden_dim2=hps.LSTM.hidden_dim2,
+    hiddem_dim3=hps.LSTM.hidden_dim3,
+    l_hidden = hps.LSTM.l_hidden,
+    num_layers = hps.LSTM.num_layers,
+    input_size = hps.data.n_mel_channels,
+    embedding_size = hps.LSTM.embedding_size,
+    kernel=5).cuda(rank)
+
+  t_model, _, _, _ =utils.load_checkpoint(utils.latest_checkpoint_path('/media/caijb/data_drive/GE2E/log/Conv_LSTM768_s/',"EMB_*.pth"),t_model)
+  net_g.emb_g = t_model
+  for p  in net_g.emb_g.parameters():
+    p.requires_grad = False
+
+  net_g = DDP(net_g, device_ids= [rank])
+  net_d = DDP(net_d, device_ids= [rank])
+  #t_model = DDP(t_model, device_ids = [rank])
+
+ 
 
   try:
     _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g)
