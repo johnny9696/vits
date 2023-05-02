@@ -6,7 +6,7 @@ import torch
 import torch.utils.data
 
 import commons 
-from mel_processing import spectrogram_torch
+from mel_processing import spectrogram_torch, spec_to_mel_torch
 from utils import load_wav_to_torch, load_filepaths_and_text
 from text import text_to_sequence, cleaned_text_to_sequence
 
@@ -308,6 +308,9 @@ class Zero_TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.hop_length     = hparams.hop_length
         self.win_length     = hparams.win_length
         self.sampling_rate  = hparams.sampling_rate
+        self.f_min = hparams.mel_fmin
+        self.f_max = hparams.mel_fmax
+        self.n_mels = hparams.n_mel_channels
 
         self.cleaned_text = getattr(hparams, "cleaned_text", False)
 
@@ -329,9 +332,9 @@ class Zero_TextAudioSpeakerLoader(torch.utils.data.Dataset):
 
         audiopaths_sid_text_new = []
         lengths = []
-        for audiopath, sid,_, text in self.audiopaths_sid_text:
+        for audiopath, sid, lang, text in self.audiopaths_sid_text:
             if self.min_text_len <= len(text) and len(text) <= self.max_text_len:
-                audiopaths_sid_text_new.append([audiopath, sid, text])
+                audiopaths_sid_text_new.append([audiopath, sid, lang ,text])
                 lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
         self.audiopaths_sid_text = audiopaths_sid_text_new
         self.lengths = lengths
@@ -345,7 +348,9 @@ class Zero_TextAudioSpeakerLoader(torch.utils.data.Dataset):
             raise()
         text = self.get_text(text)
         spec, wav = self.get_audio(audiopath)
-        return (text, spec, wav)
+        mel = spec_to_mel_torch(spec, self.win_length, self.n_mels, self.sampling_rate, self.f_min, self.f_max)
+
+        return (text, spec, wav, mel)
 
     def get_audio(self, filename):
         audio, sampling_rate = load_wav_to_torch(filename)
@@ -394,7 +399,7 @@ class Zero_TextAudioSpeakerCollate():
         """Collate's training batch from normalized text, audio and speaker identities
         PARAMS
         ------
-        batch: [text_normalized, spec_normalized, wav_normalized]
+        batch: [text_normalized, spec_normalized, wav_normalized, mel]
         """
         # Right zero-pad all one-hot text sequences to max input length
         _, ids_sorted_decreasing = torch.sort(
@@ -411,7 +416,7 @@ class Zero_TextAudioSpeakerCollate():
 
         text_padded = torch.LongTensor(len(batch), max_text_len)
         spec_padded = torch.FloatTensor(len(batch), batch[0][1].size(0), max_spec_len)
-        mel_emb_padded = torch.FloatTensor(len(batch), batch[0][1].size(0), self.slice_length)
+        mel_emb_padded = torch.FloatTensor(len(batch), batch[0][3].size(0), self.slice_length)
         wav_padded = torch.FloatTensor(len(batch), 1, max_wav_len)
         text_padded.zero_()
         spec_padded.zero_()
@@ -429,7 +434,7 @@ class Zero_TextAudioSpeakerCollate():
             spec_padded[i, :, :spec.size(1)] = spec
             spec_lengths[i] = spec.size(1)
 
-            emb_mel  = torch.abs(spec) / torch.max(torch.abs(spec))
+            emb_mel = row[3]
             if emb_mel.size(1) > self.slice_length +100:
                 mel_emb_padded[i, :, :self.slice_length] = emb_mel[:, 100:self.slice_length+100]
             elif emb_mel.size(1) > self.slice_length :
